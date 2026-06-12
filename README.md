@@ -13,7 +13,7 @@
 
 ## Cài đặt và chạy
 
-Yêu cầu Node.js LTS.
+Yêu cầu [Node.js LTS](https://nodejs.org/en).
 
 ```bash
 npm install
@@ -33,16 +33,6 @@ npm run build:portable
 ```
 
 File build xuất hiện trong thư mục `dist/`.
-
-## Cấu trúc
-
-| File / thư mục | Chức năng |
-| --- | --- |
-| `main.js` | Quản lý vòng đời app, BrowserView, session, IPC. |
-| `renderer.js` | Logic sidebar, profile, modal và điều khiển giao diện. |
-| `index.html` | Giao diện shell của ứng dụng. |
-| `preload.js` | Cầu nối an toàn giữa web content và app. |
-| `custom_style.css` | CSS tùy chỉnh cho Messenger Web. |
 
 ## Lưu ý
 
