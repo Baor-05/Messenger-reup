@@ -19,6 +19,8 @@
 2. Giải nén file `Messeger.zip`.
 3. Mở file `Messeger.exe`.
 
+### Cách 2: Dành cho DEV
+
 Yêu cầu [Node.js LTS](https://nodejs.org/en).
 
 ```bash
