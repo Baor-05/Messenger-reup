@@ -9,4 +9,6 @@ contextBridge.exposeInMainWorld('messengerApp', {
   zoomOut: () => ipcRenderer.send('zoom-out'),
   toggleFullscreen: () => ipcRenderer.send('toggle-fullscreen'),
   getSettings: () => ipcRenderer.sendSync('get-settings'),
+  reportUnreadSignal: (data) => ipcRenderer.send('messenger-unread-signal', data),
+  reportWebNotification: (data) => ipcRenderer.send('messenger-web-notification', data),
 });

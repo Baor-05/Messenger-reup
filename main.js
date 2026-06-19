@@ -44,12 +44,17 @@ const USER_AGENT =
 // ============================================================
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
-  app.quit();
+  app.exit(0);
+  process.exit(0);
 }
 
 if (process.platform === 'win32') {
   app.setAppUserModelId(APP_ID);
 }
+
+app.on('second-instance', () => {
+  showExistingInstance();
+});
 
 // ============================================================
 //  HỆ THỐNG LƯU CÀI ĐẶT
@@ -100,6 +105,8 @@ let profileNames = {}; // { profileId: displayName }
 
 let browserViews = {}; // { profileId: BrowserView }
 let webContentsIntervals = new Map(); // webContents.id -> Set<Timeout>
+let webContentsProfiles = new Map(); // webContents.id -> profileId
+let profileNotificationStates = {}; // { profileId: { signature, timestamp } }
 let activeProfileId = null;
 
 // ============================================================
@@ -144,22 +151,20 @@ function createTray() {
     if (mainWindow.isVisible() && mainWindow.isFocused()) {
       mainWindow.hide();
     } else {
-      mainWindow.show();
-      mainWindow.focus();
+      showExistingInstance();
     }
   });
 
   tray.on('double-click', () => {
     if (!mainWindow) return;
-    mainWindow.show();
-    mainWindow.focus();
+    showExistingInstance();
   });
 }
 
 function updateTrayMenu() {
   if (!tray) return;
   const contextMenu = Menu.buildFromTemplate([
-    { label: '💬 Mở Messenger', click: () => { mainWindow.show(); mainWindow.focus(); } },
+    { label: '💬 Mở Messenger', click: () => showExistingInstance() },
     { type: 'separator' },
     { label: '🔄 Tải lại trang', click: () => {
       if (activeProfileId && browserViews[activeProfileId]) {
@@ -283,21 +288,104 @@ function restoreMainWindow() {
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
+  updateMessengerAwayMode();
+}
+
+function showExistingInstance() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+  updateBrowserViewBounds();
+  updateMessengerAwayMode();
+}
+
+function isMessengerAwayModeActive() {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  return !mainWindow.isVisible() || mainWindow.isMinimized();
 }
 
 function shouldNotifyUser() {
-  if (!mainWindow || mainWindow.isDestroyed()) return false;
-  return !mainWindow.isVisible() || mainWindow.isMinimized() || !mainWindow.isFocused();
+  return isMessengerAwayModeActive();
 }
 
-function showMessageNotification(profileId, addedCount) {
-  if (!shouldNotifyUser() || !Notification.isSupported()) return;
+function playMessageSound() {
+  try {
+    shell.beep();
+  } catch {}
+}
+
+function handleIncomingMessages(profileId, addedCount, messageInfo = null) {
+  if (shouldNotifyUser()) {
+    showMessageNotification(profileId, addedCount, messageInfo);
+  } else {
+    playMessageSound();
+  }
+}
+
+function sendProfileBadge(profileId, count) {
+  if (mainWindow && !mainWindow.isDestroyed() && profileId) {
+    mainWindow.webContents.send('update-profile-badge', { id: profileId, count: count || 0 });
+  }
+}
+
+function updateProfileUnreadCount(profileId, count, messageInfo = null) {
+  if (!profileId || typeof count !== 'number' || Number.isNaN(count)) return;
+
+  const normalizedCount = Math.max(0, count);
+  const previousCount = profileUnreadCounts[profileId];
+  if (shouldNotifyUser() && previousCount > 0 && normalizedCount === 0 && !messageInfo) {
+    return;
+  }
+
+  if (typeof previousCount === 'number' && normalizedCount > previousCount) {
+    const hasMessageInfo = !!(messageInfo && (messageInfo.sender || messageInfo.message));
+    const previousNotification = profileNotificationStates[profileId];
+    const hasRecentSpecificNotification = previousNotification && Date.now() - previousNotification.timestamp < 8000;
+    if (hasMessageInfo || !hasRecentSpecificNotification) {
+      handleIncomingMessages(profileId, normalizedCount - previousCount, messageInfo);
+    }
+  }
+
+  profileUnreadCounts[profileId] = normalizedCount;
+  sendProfileBadge(profileId, normalizedCount);
+}
+
+function parseUnreadCountFromTitle(title) {
+  const match = String(title || '').match(/\((\d+)\)/);
+  return match ? parseInt(match[1], 10) : null;
+}
+
+function normalizeNotificationText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function shouldSkipDuplicateNotification(profileId, sender, body) {
+  const signature = `${normalizeNotificationText(sender)}|${normalizeNotificationText(body)}`;
+  const now = Date.now();
+  const previous = profileNotificationStates[profileId];
+  if (previous && previous.signature === signature && now - previous.timestamp < 45000) {
+    return true;
+  }
+
+  profileNotificationStates[profileId] = { signature, timestamp: now };
+  return false;
+}
+
+function showMessageNotification(profileId, addedCount, messageInfo = null) {
+  const isNotificationSupported = typeof Notification.isSupported !== 'function' || Notification.isSupported();
+  if (!shouldNotifyUser() || !isNotificationSupported) return;
 
   const profileName = profileNames[profileId] || 'Messenger';
+  const sender = normalizeNotificationText(messageInfo && messageInfo.sender ? messageInfo.sender : profileName);
+  const message = normalizeNotificationText(messageInfo && messageInfo.message ? messageInfo.message : '');
   const countText = addedCount > 1 ? `${addedCount} tin nhắn mới` : 'Có tin nhắn mới';
+  const body = message || countText;
+  if (shouldSkipDuplicateNotification(profileId, sender, body)) return;
+
   const notification = new Notification({
-    title: profileName,
-    body: countText,
+    title: sender,
+    body,
     icon: path.join(__dirname, 'icon.png'),
     silent: false,
   });
@@ -312,6 +400,316 @@ function showMessageNotification(profileId, addedCount) {
   });
 
   notification.show();
+}
+
+function buildMessengerAwayScript(away) {
+  return `
+    (function() {
+      if (!window.__messengerAwayPatchInstalled) {
+        window.__messengerAwayPatchInstalled = true;
+        window.__messengerAwayMode = false;
+        var hiddenDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'hidden');
+        var visibilityDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'visibilityState');
+        var originalHasFocus = document.hasFocus ? document.hasFocus.bind(document) : function() { return true; };
+
+        try {
+          Object.defineProperty(Document.prototype, 'hidden', {
+            configurable: true,
+            get: function() {
+              return window.__messengerAwayMode ? true : (hiddenDescriptor && hiddenDescriptor.get ? hiddenDescriptor.get.call(this) : false);
+            }
+          });
+        } catch (e) {}
+
+        try {
+          Object.defineProperty(Document.prototype, 'visibilityState', {
+            configurable: true,
+            get: function() {
+              return window.__messengerAwayMode ? 'hidden' : (visibilityDescriptor && visibilityDescriptor.get ? visibilityDescriptor.get.call(this) : 'visible');
+            }
+          });
+        } catch (e) {}
+
+        document.hasFocus = function() {
+          return window.__messengerAwayMode ? false : originalHasFocus();
+        };
+
+        window.__messengerSetAwayMode = function(value) {
+          var next = !!value;
+          if (window.__messengerAwayMode === next) return;
+          window.__messengerAwayMode = next;
+          window.dispatchEvent(new Event(next ? 'blur' : 'focus'));
+          document.dispatchEvent(new Event('visibilitychange'));
+        };
+      }
+
+      window.__messengerSetAwayMode(${away ? 'true' : 'false'});
+    })();
+  `;
+}
+
+function setWebContentsAwayMode(contents, away) {
+  if (!contents || contents.isDestroyed()) return;
+  contents.executeJavaScript(buildMessengerAwayScript(away)).catch(() => {});
+}
+
+function setAllMessengerAwayMode(away) {
+  Object.values(browserViews).forEach((view) => {
+    if (view && view.webContents) {
+      setWebContentsAwayMode(view.webContents, away);
+    }
+  });
+}
+
+function updateMessengerAwayMode() {
+  setAllMessengerAwayMode(isMessengerAwayModeActive());
+}
+
+function buildMessengerNotificationBridgeScript() {
+  return `
+    (function() {
+      if (window.__messengerNotificationBridgeInstalled || typeof window.Notification !== 'function') return;
+      window.__messengerNotificationBridgeInstalled = true;
+
+      var NativeNotification = window.Notification;
+
+      function reportNotification(title, options) {
+        var payload = {
+          sender: String(title || ''),
+          message: String((options && options.body) || ''),
+          icon: String((options && options.icon) || '')
+        };
+
+        if (window.messengerApp && typeof window.messengerApp.reportWebNotification === 'function') {
+          window.messengerApp.reportWebNotification(payload);
+        }
+      }
+
+      function FakeNotification(title, options) {
+        reportNotification(title, options || {});
+
+        var target = new EventTarget();
+        target.title = String(title || '');
+        target.body = String((options && options.body) || '');
+        target.icon = String((options && options.icon) || '');
+        target.close = function() {
+          setTimeout(function() {
+            try { target.dispatchEvent(new Event('close')); } catch (e) {}
+          }, 0);
+        };
+
+        setTimeout(function() {
+          try { target.dispatchEvent(new Event('show')); } catch (e) {}
+          if (typeof target.onshow === 'function') target.onshow(new Event('show'));
+        }, 0);
+
+        return target;
+      }
+
+      FakeNotification.requestPermission = function(callback) {
+        var result;
+        try {
+          result = NativeNotification.requestPermission(callback);
+        } catch (e) {
+          result = Promise.resolve('granted');
+          if (typeof callback === 'function') callback('granted');
+        }
+        return result;
+      };
+
+      Object.defineProperty(FakeNotification, 'permission', {
+        configurable: true,
+        get: function() {
+          try { return NativeNotification.permission || 'granted'; } catch (e) { return 'granted'; }
+        }
+      });
+
+      try {
+        FakeNotification.prototype = NativeNotification.prototype;
+      } catch (e) {}
+
+      window.Notification = FakeNotification;
+    })();
+  `;
+}
+
+function installMessengerNotificationBridge(contents) {
+  if (!contents || contents.isDestroyed()) return;
+  contents.executeJavaScript(buildMessengerNotificationBridgeScript()).catch(() => {});
+}
+
+function buildMessengerUnreadObserverScript() {
+  return `
+    (function() {
+      if (window.__messengerUnreadObserverInstalled) return;
+      window.__messengerUnreadObserverInstalled = true;
+
+      var lastSignature = '';
+      var pendingTimer = null;
+
+      function readUnreadCount() {
+        var title = document.title || '';
+        var titleMatch = title.match(/\\((\\d+)\\)/);
+        if (titleMatch) return parseInt(titleMatch[1], 10);
+
+        var selectors = [
+          '[data-testid="MWJewelThreadListUnread"]',
+          '[aria-label*="unread"]',
+          '[aria-label*="chưa đọc"]',
+          'span.pq6dq46d'
+        ];
+
+        var total = 0;
+        selectors.forEach(function(selector) {
+          document.querySelectorAll(selector).forEach(function(node) {
+            var label = node.getAttribute('aria-label') || '';
+            var text = node.textContent || '';
+            var source = text || label;
+            var match = source.match(/\\d+/);
+            if (match) {
+              var n = parseInt(match[0], 10);
+              if (!isNaN(n)) total += n;
+            }
+          });
+        });
+
+        return total;
+      }
+
+      function cleanText(value) {
+        return String(value || '').replace(/\\s+/g, ' ').trim();
+      }
+
+      function findThreadContainer(node) {
+        var current = node;
+        for (var i = 0; current && i < 8; i += 1) {
+          var role = current.getAttribute && current.getAttribute('role');
+          var aria = cleanText(current.getAttribute && current.getAttribute('aria-label'));
+          var text = cleanText(current.innerText || current.textContent || '');
+          if (
+            role === 'row' ||
+            role === 'link' ||
+            role === 'listitem' ||
+            (aria && text && text.length > 10)
+          ) {
+            return current;
+          }
+          current = current.parentElement;
+        }
+        return node;
+      }
+
+      function parseMessageInfoFromText(rawText) {
+        var text = cleanText(rawText);
+        if (!text) return null;
+
+        var noise = [
+          /^active now$/i,
+          /^đang hoạt động$/i,
+          /^sent$/i,
+          /^đã gửi$/i,
+          /^you:/i,
+          /^bạn:/i
+        ];
+
+        var parts = text
+          .split(/\\n| · | • |\\s{2,}/)
+          .map(cleanText)
+          .filter(function(part) {
+            return part && !noise.some(function(pattern) { return pattern.test(part); });
+          });
+
+        if (parts.length === 0) return null;
+
+        var sender = parts[0];
+        var message = '';
+        for (var i = 1; i < parts.length; i += 1) {
+          if (parts[i] && parts[i] !== sender) {
+            message = parts[i];
+            break;
+          }
+        }
+
+        if (!message && parts.length > 1) message = parts[parts.length - 1];
+        if (!message || message === sender) return null;
+
+        return {
+          sender: sender.slice(0, 80),
+          message: message.slice(0, 180)
+        };
+      }
+
+      function readLastMessageInfo() {
+        var selectors = [
+          '[data-testid="MWJewelThreadListUnread"]',
+          '[aria-label*="unread"]',
+          '[aria-label*="chưa đọc"]',
+          'span.pq6dq46d'
+        ];
+
+        for (var i = 0; i < selectors.length; i += 1) {
+          var nodes = document.querySelectorAll(selectors[i]);
+          for (var j = 0; j < nodes.length; j += 1) {
+            var container = findThreadContainer(nodes[j]);
+            var info = parseMessageInfoFromText(container && (container.innerText || container.textContent));
+            if (info) return info;
+          }
+        }
+
+        var rows = document.querySelectorAll('[role="row"], [role="listitem"], [role="link"]');
+        for (var k = 0; k < Math.min(rows.length, 12); k += 1) {
+          var rowText = rows[k].innerText || rows[k].textContent || '';
+          if (/unread|chưa đọc|\\d+/.test(rowText.toLowerCase())) {
+            var fallbackInfo = parseMessageInfoFromText(rowText);
+            if (fallbackInfo) return fallbackInfo;
+          }
+        }
+
+        return null;
+      }
+
+      function report(reason) {
+        var count = readUnreadCount();
+        var title = document.title || '';
+        var messageInfo = readLastMessageInfo();
+        var signature = reason + '|' + count + '|' + title + '|' + JSON.stringify(messageInfo || {});
+        if (signature === lastSignature) return;
+        lastSignature = signature;
+
+        if (window.messengerApp && typeof window.messengerApp.reportUnreadSignal === 'function') {
+          window.messengerApp.reportUnreadSignal({ reason: reason, count: count, title: title, messageInfo: messageInfo });
+        }
+      }
+
+      function scheduleReport(reason) {
+        clearTimeout(pendingTimer);
+        pendingTimer = setTimeout(function() { report(reason); }, 120);
+      }
+
+      var titleElement = document.querySelector('title');
+      if (titleElement) {
+        new MutationObserver(function() { scheduleReport('title'); }).observe(titleElement, {
+          childList: true,
+          characterData: true,
+          subtree: true
+        });
+      }
+
+      new MutationObserver(function() { scheduleReport('dom'); }).observe(document.documentElement, {
+        childList: true,
+        characterData: true,
+        subtree: true
+      });
+
+      setInterval(function() { report('fast-timer'); }, 1000);
+      report('init');
+    })();
+  `;
+}
+
+function installMessengerUnreadObserver(contents) {
+  if (!contents || contents.isDestroyed()) return;
+  contents.executeJavaScript(buildMessengerUnreadObserverScript()).catch(() => {});
 }
 
 function toggleBlockSeen(enable) {
@@ -515,6 +913,11 @@ function getMessengerPopupOptions(partition) {
 }
 
 function setupWebContents(contents, profileId, partition, options = {}) {
+  if (profileId) {
+    webContentsProfiles.set(contents.id, profileId);
+    contents.once('destroyed', () => webContentsProfiles.delete(contents.id));
+  }
+
   // Setup download handler for this view's session
   setupDownloadHandler(contents.session);
 
@@ -573,6 +976,16 @@ function setupWebContents(contents, profileId, partition, options = {}) {
       const cssData = fs.readFileSync(cssPath, 'utf8');
       contents.insertCSS(cssData);
     } catch(e) {}
+    setWebContentsAwayMode(contents, isMessengerAwayModeActive());
+    installMessengerNotificationBridge(contents);
+    installMessengerUnreadObserver(contents);
+  });
+
+  contents.on('page-title-updated', (event, title) => {
+    const count = parseUnreadCountFromTitle(title);
+    if (count !== null) {
+      updateProfileUnreadCount(profileId, count);
+    }
   });
 
   if (!options.skipMessengerPolling) {
@@ -615,16 +1028,9 @@ function setupWebContents(contents, profileId, partition, options = {}) {
           return total;
         })();
       `);
-      const previousCount = profileUnreadCounts[profileId];
-      if (typeof previousCount === 'number' && count > previousCount) {
-        showMessageNotification(profileId, count - previousCount);
-      }
-      profileUnreadCounts[profileId] = count || 0;
-      if (mainWindow && !mainWindow.isDestroyed() && profileId) {
-        mainWindow.webContents.send('update-profile-badge', { id: profileId, count: count || 0 });
-      }
+      updateProfileUnreadCount(profileId, count || 0);
     } catch(e) {}
-  }, 3000);
+  }, 1000);
   trackWebContentsInterval(contents, unreadInterval);
   }
 
@@ -674,7 +1080,7 @@ function createWindow() {
       let cancel = false;
       
       // Chặn Đã xem (Block Seen)
-      if (settings.blockSeen) {
+      if (settings.blockSeen || isMessengerAwayModeActive()) {
         if (details.url.includes('/change_read_status.php') || details.url.includes('/ajax/mercury/change_read_status.php')) {
           cancel = true;
         }
@@ -743,7 +1149,13 @@ function createWindow() {
 
   mainWindow.on('focus', () => {
     mainWindow.flashFrame(false);
+    updateMessengerAwayMode();
   });
+
+  mainWindow.on('show', updateMessengerAwayMode);
+  mainWindow.on('restore', updateMessengerAwayMode);
+  mainWindow.on('minimize', updateMessengerAwayMode);
+  mainWindow.on('hide', updateMessengerAwayMode);
 
   mainWindow.on('resize', updateBrowserViewBounds);
   mainWindow.on('maximize', updateBrowserViewBounds);
@@ -778,6 +1190,7 @@ function createWindow() {
     }
     mainWindow.setBrowserView(browserViews[profile.id]);
     updateBrowserViewBounds();
+    updateMessengerAwayMode();
   });
 
   // ── Đăng xuất / Xóa session cho 1 profile ──
@@ -815,6 +1228,7 @@ function createWindow() {
       if (activeProfileId === id) {
         mainWindow.setBrowserView(view);
         updateBrowserViewBounds();
+        updateMessengerAwayMode();
       }
 
       event.reply('logout-profile-done', { id, success: true });
@@ -860,6 +1274,35 @@ function createWindow() {
       if (hadNewMessages && !mainWindow.isFocused()) {
         mainWindow.flashFrame(true);
       }
+    }
+  });
+
+  ipcMain.on('messenger-unread-signal', (event, data = {}) => {
+    const profileId = webContentsProfiles.get(event.sender.id);
+    if (!profileId) return;
+
+    let count = typeof data.count === 'number' ? data.count : null;
+    if (count === null) {
+      count = parseUnreadCountFromTitle(data.title);
+    }
+    if (typeof count === 'number' && !Number.isNaN(count)) {
+      updateProfileUnreadCount(profileId, count, data.messageInfo || null);
+    }
+  });
+
+  ipcMain.on('messenger-web-notification', (event, data = {}) => {
+    const profileId = webContentsProfiles.get(event.sender.id);
+    if (!profileId) return;
+
+    const messageInfo = {
+      sender: normalizeNotificationText(data.sender) || (profileNames[profileId] || 'Messenger'),
+      message: normalizeNotificationText(data.message),
+    };
+
+    if (shouldNotifyUser()) {
+      showMessageNotification(profileId, 1, messageInfo);
+    } else {
+      playMessageSound();
     }
   });
 
@@ -994,8 +1437,7 @@ function registerGlobalShortcuts() {
       if (mainWindow.isVisible() && mainWindow.isFocused()) {
         mainWindow.hide();
       } else {
-        mainWindow.show();
-        mainWindow.focus();
+        showExistingInstance();
       }
     });
   } catch (err) {}
@@ -1011,14 +1453,6 @@ app.whenReady().then(() => {
   createTray();
   registerGlobalShortcuts();
   setupAutoUpdater();
-
-  app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.show();
-      mainWindow.focus();
-    }
-  });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
