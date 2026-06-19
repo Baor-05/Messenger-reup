@@ -99,6 +99,7 @@ let profileUnreadCounts = {}; // { profileId: count }
 let profileNames = {}; // { profileId: displayName }
 
 let browserViews = {}; // { profileId: BrowserView }
+let webContentsIntervals = new Map(); // webContents.id -> Set<Timeout>
 let activeProfileId = null;
 
 // ============================================================
@@ -175,9 +176,106 @@ function updateTrayMenu() {
     { type: 'separator' },
     { label: '⬇️ Kiểm tra cập nhật', click: () => checkForUpdates(true) },
     { type: 'separator' },
-    { label: '❌ Thoát hoàn toàn', click: () => { isQuitting = true; app.quit(); } },
+    { label: '❌ Thoát hoàn toàn', click: () => quitAppCompletely() },
   ]);
   tray.setContextMenu(contextMenu);
+}
+
+function trackWebContentsInterval(contents, intervalId) {
+  if (!contents || contents.isDestroyed()) {
+    clearInterval(intervalId);
+    return intervalId;
+  }
+
+  let intervals = webContentsIntervals.get(contents.id);
+  if (!intervals) {
+    intervals = new Set();
+    webContentsIntervals.set(contents.id, intervals);
+    contents.once('destroyed', () => clearWebContentsIntervals(contents.id));
+  }
+
+  intervals.add(intervalId);
+  return intervalId;
+}
+
+function clearWebContentsIntervals(contentsOrId) {
+  const contentsId = typeof contentsOrId === 'number' ? contentsOrId : contentsOrId && contentsOrId.id;
+  if (!contentsId) return;
+
+  const intervals = webContentsIntervals.get(contentsId);
+  if (!intervals) return;
+
+  intervals.forEach((intervalId) => clearInterval(intervalId));
+  webContentsIntervals.delete(contentsId);
+}
+
+function destroyBrowserView(profileId) {
+  const view = browserViews[profileId];
+  if (!view) return;
+
+  try {
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.getBrowserView() === view) {
+      mainWindow.setBrowserView(null);
+    }
+  } catch {}
+
+  try {
+    if (view.webContents) {
+      clearWebContentsIntervals(view.webContents);
+      if (!view.webContents.isDestroyed()) {
+        view.webContents.destroy();
+      }
+    }
+  } catch {}
+
+  delete browserViews[profileId];
+}
+
+function destroyAllBrowserViews() {
+  Object.keys(browserViews).forEach((profileId) => destroyBrowserView(profileId));
+  webContentsIntervals.forEach((intervals) => {
+    intervals.forEach((intervalId) => clearInterval(intervalId));
+  });
+  webContentsIntervals.clear();
+}
+
+function saveWindowBounds() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    settings.windowBounds = mainWindow.getBounds();
+    saveSettings(settings);
+  } catch {}
+}
+
+function prepareForFullQuit() {
+  isQuitting = true;
+  saveWindowBounds();
+  destroyAllBrowserViews();
+
+  if (tray) {
+    try {
+      tray.destroy();
+    } catch {}
+    tray = null;
+  }
+
+  try {
+    globalShortcut.unregisterAll();
+  } catch {}
+}
+
+function quitAppCompletely() {
+  prepareForFullQuit();
+
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try {
+      mainWindow.removeAllListeners('close');
+      mainWindow.destroy();
+    } catch {}
+  }
+
+  setTimeout(() => app.exit(0), 1000).unref();
+  app.quit();
 }
 
 function restoreMainWindow() {
@@ -234,6 +332,10 @@ let isManualUpdateCheck = false;
 function setupAutoUpdater() {
   autoUpdater.autoDownload = false;
 
+  autoUpdater.on('before-quit-for-update', () => {
+    prepareForFullQuit();
+  });
+
   autoUpdater.on('update-available', (info) => {
     dialog.showMessageBox({
       type: 'info',
@@ -263,8 +365,9 @@ function setupAutoUpdater() {
       message: 'Bản cập nhật đã được tải xuống. Ứng dụng sẽ khởi động lại để cài đặt.',
       buttons: ['Cài đặt và Khởi động lại']
     }).then(() => {
-      isQuitting = true;
+      prepareForFullQuit();
       autoUpdater.quitAndInstall();
+      setTimeout(() => app.exit(0), 5000).unref();
     });
   });
 
@@ -489,6 +592,7 @@ function setupWebContents(contents, profileId, partition, options = {}) {
       }
     } catch(e) {}
   }, 5000);
+  trackWebContentsInterval(contents, avatarInterval);
 
   // ── Unread badge per profile ──
   const unreadInterval = setInterval(async () => {
@@ -521,6 +625,7 @@ function setupWebContents(contents, profileId, partition, options = {}) {
       }
     } catch(e) {}
   }, 3000);
+  trackWebContentsInterval(contents, unreadInterval);
   }
 
   if (app.isPackaged) {
@@ -682,11 +787,7 @@ function createWindow() {
     try {
       // 1. Destroy BrowserView nếu đang tồn tại
       if (browserViews[id]) {
-        if (mainWindow && mainWindow.getBrowserView() === browserViews[id]) {
-          mainWindow.setBrowserView(null);
-        }
-        browserViews[id].webContents.destroy();
-        delete browserViews[id];
+        destroyBrowserView(id);
       }
 
       // 2. Xóa sạch cookies + cache + storage của partition
@@ -745,8 +846,7 @@ function createWindow() {
 
   ipcMain.on('delete-profile', (event, id) => {
     if (browserViews[id]) {
-      browserViews[id].webContents.destroy();
-      delete browserViews[id];
+      destroyBrowserView(id);
     }
     delete profileUnreadCounts[id];
     delete profileNames[id];
@@ -929,11 +1029,7 @@ app.whenReady().then(() => {
 //  XỬ LÝ THOÁT
 // ============================================================
 app.on('before-quit', () => {
-  isQuitting = true;
-  if (mainWindow) {
-    settings.windowBounds = mainWindow.getBounds();
-    saveSettings(settings);
-  }
+  prepareForFullQuit();
 });
 
 app.on('will-quit', () => {
