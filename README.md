@@ -16,7 +16,7 @@
 ### Cách 1: Dành cho người sử dụng phổ thông
 
 1. Truy cập trang [Releases](https://github.com/Baor-05/Messenger-reup/releases).
-2. Tải file cài đặt `.exe`, ví dụ `MessengerSetup-1.1.3.exe`.
+2. Tải file cài đặt `.exe`, ví dụ `MessengerSetup-1.1.4.exe`.
 3. Mở file `.exe` vừa tải và cài đặt là xong.
 
 ### Cách 2: Dành cho DEV

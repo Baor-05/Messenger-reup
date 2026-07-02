@@ -36,6 +36,7 @@ const {
 //  HỆ THỐNG DOWNLOAD
 // ============================================================
 let activeDownloads = new Map(); // id -> { item, filename, savePath, received, total }
+let completedDownloadPaths = new Set();
 let downloadCounter = 0;
 
 // ============================================================
@@ -83,6 +84,8 @@ const DEFAULT_SETTINGS = {
   appLockEnabled: false,
   appLockHash: '',
   appLockTimeout: 5,
+  sleepBackgroundProfiles: true,
+  backgroundSleepMinutes: 10,
 };
 
 function loadSettings() {
@@ -110,12 +113,21 @@ let isQuitting = false;
 let unreadCount = 0;
 let profileUnreadCounts = {}; // { profileId: count }
 let profileNames = {}; // { profileId: displayName }
+let profilePartitions = {}; // { profileId: partition }
 
 let browserViews = {}; // { profileId: BrowserView }
 let webContentsIntervals = new Map(); // webContents.id -> Set<Timeout>
 let webContentsProfiles = new Map(); // webContents.id -> profileId
 let privacyScriptIdentifiers = new Map(); // webContents.id -> CDP script identifier
 let activeProfileId = null;
+let profileSleepTimers = new Map();
+let updateTrayState = {
+  available: false,
+  downloaded: false,
+  version: '',
+  releaseNotes: '',
+  error: '',
+};
 
 // ============================================================
 //  TẠO ICON BADGE
@@ -171,8 +183,17 @@ function createTray() {
 
 function updateTrayMenu() {
   if (!tray) return;
+  const updateLabel = updateTrayState.downloaded
+    ? `Cài bản cập nhật v${updateTrayState.version}`
+    : (updateTrayState.available
+      ? `Tải bản cập nhật v${updateTrayState.version}`
+      : 'Kiểm tra cập nhật');
   const contextMenu = Menu.buildFromTemplate([
     { label: 'Mở Messenger', click: () => showExistingInstance() },
+    { label: `Phiên bản hiện tại: ${app.getVersion()}`, enabled: false },
+    updateTrayState.available || updateTrayState.downloaded
+      ? { label: `Có bản mới: v${updateTrayState.version}`, enabled: false }
+      : { label: 'Chưa có thông tin cập nhật mới', enabled: false },
     { type: 'separator' },
     { label: 'Tải lại trang', click: () => {
       if (activeProfileId && browserViews[activeProfileId]) {
@@ -181,13 +202,22 @@ function updateTrayMenu() {
     }},
     { label: 'Khởi động cùng Windows', type: 'checkbox', checked: settings.autoLaunch, click: (item) => toggleAutoLaunch(item.checked) },
     { label: 'Thu nhỏ xuống Tray khi đóng', type: 'checkbox', checked: settings.minimizeToTray, click: (item) => { settings.minimizeToTray = item.checked; saveSettings(settings); } },
+    { label: 'Sleep profile nền để giảm RAM', type: 'checkbox', checked: !!settings.sleepBackgroundProfiles, click: (item) => toggleBackgroundProfileSleep(item.checked) },
+    { label: 'Dọn cache', submenu: [
+        { label: 'Chỉ dọn cache', click: () => clearAppCache(false) },
+        { label: 'Dọn cache và đăng xuất tất cả', click: () => clearAppCache(true) },
+    ]},
     { type: 'separator' },
     { label: 'Bảo mật', submenu: [
         { label: 'Chặn hiển thị "Đã xem"', type: 'checkbox', checked: settings.blockSeen, click: (item) => toggleBlockSeen(item.checked) },
         { label: 'Chặn hiển thị "Đang nhập"', type: 'checkbox', checked: settings.blockTyping, click: (item) => toggleBlockTyping(item.checked) }
     ]},
     { type: 'separator' },
-    { label: 'Kiểm tra cập nhật', click: () => checkForUpdates(true) },
+    { label: updateLabel, click: () => {
+      if (updateTrayState.downloaded) installDownloadedUpdate();
+      else if (updateTrayState.available) startUpdateDownload();
+      else checkForUpdates(true);
+    }},
     { type: 'separator' },
     { label: 'Thoát hoàn toàn', click: () => quitAppCompletely() },
   ]);
@@ -250,6 +280,117 @@ function destroyAllBrowserViews() {
     intervals.forEach((intervalId) => clearInterval(intervalId));
   });
   webContentsIntervals.clear();
+  profileSleepTimers.forEach((timerId) => clearTimeout(timerId));
+  profileSleepTimers.clear();
+}
+
+function getKnownProfilePartitions() {
+  const partitions = new Set(Object.values(profilePartitions).filter(Boolean));
+  Object.values(browserViews).forEach((view) => {
+    const partition = view?.webContents?.session?.getPartition?.();
+    if (partition) partitions.add(partition);
+  });
+  return [...partitions];
+}
+
+async function clearAppCache(clearSessionData = false) {
+  const title = clearSessionData ? 'Dọn cache và đăng xuất tất cả' : 'Dọn cache';
+  const message = clearSessionData
+    ? 'Thao tác này sẽ xóa cache, cookies và session của tất cả tài khoản. Bạn sẽ cần đăng nhập lại.'
+    : 'Thao tác này chỉ xóa cache tạm để giảm dung lượng và xử lý lỗi tải trang. Tài khoản vẫn được giữ đăng nhập.';
+
+  const result = await dialog.showMessageBox({
+    type: clearSessionData ? 'warning' : 'question',
+    title,
+    message,
+    buttons: [clearSessionData ? 'Xóa và đăng xuất' : 'Dọn cache', 'Hủy'],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  if (result.response !== 0) return;
+
+  const partitions = getKnownProfilePartitions();
+  try {
+    const sessions = [session.defaultSession, ...partitions.map((partition) => session.fromPartition(partition))];
+    await Promise.all(sessions.map(async (sess) => {
+      await sess.clearCache();
+      if (clearSessionData) {
+        await sess.clearStorageData({
+          storages: ['cookies', 'localstorage', 'sessionstorage', 'cachestorage', 'indexdb', 'shadercache', 'websql', 'serviceworkers'],
+        });
+        await sess.clearAuthCache();
+      }
+    }));
+
+    if (clearSessionData) {
+      destroyAllBrowserViews();
+      profileUnreadCounts = {};
+      unreadCount = 0;
+      updateBadge(0);
+      const activePartition = activeProfileId && profilePartitions[activeProfileId];
+      if (activePartition && mainWindow && !mainWindow.isDestroyed()) {
+        const view = new BrowserView({
+          webPreferences: {
+            partition: activePartition,
+            preload: path.join(__dirname, 'preload.js'),
+            contextIsolation: true,
+            nodeIntegration: false,
+          },
+        });
+        browserViews[activeProfileId] = view;
+        await setupWebContents(view.webContents, activeProfileId, activePartition);
+        await view.webContents.loadURL(MESSENGER_URL, { userAgent: USER_AGENT });
+        mainWindow.setBrowserView(view);
+        updateBrowserViewBounds();
+        updateMessengerAwayMode();
+      }
+    } else {
+      Object.values(browserViews).forEach((view) => {
+        if (view?.webContents && !view.webContents.isDestroyed()) view.webContents.reloadIgnoringCache();
+      });
+    }
+
+    dialog.showMessageBox({
+      type: 'info',
+      title: 'Hoàn tất',
+      message: clearSessionData ? 'Đã xóa cache và session.' : 'Đã dọn cache.',
+    });
+  } catch (error) {
+    dialog.showErrorBox('Không thể dọn cache', error?.message || String(error));
+  }
+}
+
+function clearProfileSleepTimer(profileId) {
+  const timerId = profileSleepTimers.get(profileId);
+  if (timerId) clearTimeout(timerId);
+  profileSleepTimers.delete(profileId);
+}
+
+function scheduleProfileSleep(profileId) {
+  clearProfileSleepTimer(profileId);
+  if (!settings.sleepBackgroundProfiles || !profileId || profileId === activeProfileId || !browserViews[profileId]) return;
+
+  const minutes = Math.max(1, Number(settings.backgroundSleepMinutes || 10));
+  const timerId = setTimeout(() => {
+    if (settings.sleepBackgroundProfiles && profileId !== activeProfileId && browserViews[profileId]) {
+      destroyBrowserView(profileId);
+    }
+    profileSleepTimers.delete(profileId);
+  }, minutes * 60 * 1000);
+  timerId.unref?.();
+  profileSleepTimers.set(profileId, timerId);
+}
+
+function toggleBackgroundProfileSleep(enable) {
+  settings.sleepBackgroundProfiles = !!enable;
+  saveSettings(settings);
+  if (!enable) {
+    profileSleepTimers.forEach((timerId) => clearTimeout(timerId));
+    profileSleepTimers.clear();
+  } else {
+    Object.keys(browserViews).forEach((profileId) => scheduleProfileSleep(profileId));
+  }
+  updateTrayMenu();
 }
 
 function saveWindowBounds() {
@@ -701,6 +842,14 @@ function setupPrivacyRequestBlocker(sess) {
   );
 }
 
+function buildTrayTooltip() {
+  const unreadPart = unreadCount > 0 ? ` — ${unreadCount} tin nhắn chưa đọc` : '';
+  const updatePart = updateTrayState.downloaded
+    ? ` — bản v${updateTrayState.version} đã tải xong`
+    : (updateTrayState.available ? ` — có bản mới v${updateTrayState.version}` : '');
+  return `${APP_NAME}${unreadPart}${updatePart}`;
+}
+
 const privacyNetworkDebuggerContents = new Set();
 const privacyWebSocketUrls = new Map();
 const privacyWorkerSessionsByContents = new Map();
@@ -897,6 +1046,7 @@ function toggleBlockTyping(enable) {
 let isManualUpdateCheck = false;
 let isUpdateDownloadActive = false;
 let pendingUpdateVersion = '';
+let pendingUpdateReleaseNotes = '';
 
 function showUpdateProgress(state) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -906,6 +1056,7 @@ function showUpdateProgress(state) {
   mainWindow.webContents.send('update-progress-state', {
     visible: true,
     version: pendingUpdateVersion,
+    releaseNotes: pendingUpdateReleaseNotes,
     ...state,
   });
 
@@ -918,6 +1069,48 @@ function showUpdateProgress(state) {
   } else {
     mainWindow.setProgressBar(0.01, { mode: 'indeterminate' });
   }
+}
+
+function setUpdateTrayState(nextState = {}) {
+  updateTrayState = {
+    ...updateTrayState,
+    ...nextState,
+  };
+  updateTrayMenu();
+  if (tray) {
+    tray.setToolTip(buildTrayTooltip());
+  }
+}
+
+function startUpdateDownload() {
+  if (!updateTrayState.available || isUpdateDownloadActive) return;
+  isUpdateDownloadActive = true;
+  showUpdateProgress({
+    phase: 'downloading',
+    percent: 0,
+    transferred: 0,
+    total: 0,
+    bytesPerSecond: 0,
+  });
+  autoUpdater.downloadUpdate().catch((error) => {
+    isUpdateDownloadActive = false;
+    setUpdateTrayState({ error: error?.message || 'Không thể tải bản cập nhật.' });
+    showUpdateProgress({
+      phase: 'error',
+      message: `${error?.message || 'Không thể tải bản cập nhật.'} Ứng dụng vẫn giữ phiên bản hiện tại.`,
+    });
+  });
+}
+
+function installDownloadedUpdate() {
+  if (!updateTrayState.downloaded) return;
+  showUpdateProgress({
+    phase: 'installing',
+    percent: 100,
+  });
+  prepareForFullQuit();
+  autoUpdater.quitAndInstall();
+  setTimeout(() => app.exit(0), 5000).unref();
 }
 
 function closeUpdateProgress() {
@@ -940,33 +1133,36 @@ function setupAutoUpdater() {
 
   autoUpdater.on('update-available', (info) => {
     pendingUpdateVersion = info.version || '';
+    pendingUpdateReleaseNotes = Array.isArray(info.releaseNotes)
+      ? info.releaseNotes.map((item) => item.note || item).join('\n')
+      : (info.releaseNotes || '');
+    setUpdateTrayState({
+      available: true,
+      downloaded: false,
+      version: pendingUpdateVersion,
+      releaseNotes: pendingUpdateReleaseNotes,
+      error: '',
+    });
     dialog.showMessageBox({
       type: 'info',
       title: 'Có bản cập nhật mới',
       message: `Đã có bản cập nhật mới v${info.version}. Bạn có muốn tải xuống và cài đặt không?`,
-      buttons: ['Tải xuống', 'Bỏ qua']
+      buttons: ['Tải xuống', 'Cài sau']
     }).then(result => {
       if (result.response === 0) {
-        isUpdateDownloadActive = true;
-        showUpdateProgress({
-          phase: 'downloading',
-          percent: 0,
-          transferred: 0,
-          total: 0,
-          bytesPerSecond: 0,
-        });
-        autoUpdater.downloadUpdate().catch((error) => {
-          showUpdateProgress({
-            phase: 'error',
-            message: error?.message || 'Không thể tải bản cập nhật.',
-          });
-          isUpdateDownloadActive = false;
-        });
+        startUpdateDownload();
       }
     });
   });
 
   autoUpdater.on('update-not-available', (info) => {
+    setUpdateTrayState({
+      available: false,
+      downloaded: false,
+      version: '',
+      releaseNotes: '',
+      error: '',
+    });
     if (isManualUpdateCheck) {
       dialog.showMessageBox({
         title: 'Không có cập nhật',
@@ -989,22 +1185,16 @@ function setupAutoUpdater() {
 
   autoUpdater.on('update-downloaded', () => {
     isUpdateDownloadActive = false;
+    setUpdateTrayState({
+      available: true,
+      downloaded: true,
+      version: pendingUpdateVersion,
+      releaseNotes: pendingUpdateReleaseNotes,
+      error: '',
+    });
     showUpdateProgress({
       phase: 'downloaded',
       percent: 100,
-    });
-    dialog.showMessageBox({
-      title: 'Đã tải xong cập nhật',
-      message: 'Bản cập nhật đã được tải xuống. Ứng dụng sẽ khởi động lại để cài đặt.',
-      buttons: ['Cài đặt và Khởi động lại']
-    }).then(() => {
-      showUpdateProgress({
-        phase: 'installing',
-        percent: 100,
-      });
-      prepareForFullQuit();
-      autoUpdater.quitAndInstall();
-      setTimeout(() => app.exit(0), 5000).unref();
     });
   });
 
@@ -1012,9 +1202,10 @@ function setupAutoUpdater() {
     const errorMessage = err == null ? 'Lỗi không xác định' : (err.stack || err).toString();
     if (isUpdateDownloadActive) {
       isUpdateDownloadActive = false;
+      setUpdateTrayState({ error: errorMessage });
       showUpdateProgress({
         phase: 'error',
-        message: errorMessage,
+        message: `${errorMessage} Ứng dụng vẫn giữ phiên bản hiện tại.`,
       });
     }
 
@@ -1100,6 +1291,12 @@ function setupDownloadHandler(sess) {
     });
 
     item.once('done', (event, state) => {
+      if (state === 'completed') {
+        completedDownloadPaths.add(path.resolve(savePath));
+        if (completedDownloadPaths.size > 200) {
+          completedDownloadPaths = new Set([...completedDownloadPaths].slice(-100));
+        }
+      }
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('download-done', {
           id, state, savePath, filename,
@@ -1120,6 +1317,19 @@ function isAllowedHttpsHost(url, hosts) {
     if (parsed.protocol !== 'https:') return false;
     const host = parsed.hostname.toLowerCase();
     return hosts.some((allowedHost) => host === allowedHost || host.endsWith(`.${allowedHost}`));
+  } catch {
+    return false;
+  }
+}
+
+function isSafeDownloadPath(filePath) {
+  if (!filePath || typeof filePath !== 'string') return false;
+  try {
+    const resolvedFile = path.resolve(filePath);
+    const resolvedDownloads = path.resolve(app.getPath('downloads'));
+    return completedDownloadPaths.has(resolvedFile)
+      || resolvedFile === resolvedDownloads
+      || resolvedFile.startsWith(`${resolvedDownloads}${path.sep}`);
   } catch {
     return false;
   }
@@ -1311,7 +1521,13 @@ async function setupWebContents(contents, profileId, partition, options = {}) {
     }
     if (params.linkURL) {
       menu.append(new MenuItem({ type: 'separator' }));
-      menu.append(new MenuItem({ label: 'Mở liên kết', click: () => shell.openExternal(params.linkURL) }));
+      menu.append(new MenuItem({
+        label: 'Mở liên kết',
+        enabled: isExternalWebUrl(params.linkURL),
+        click: () => {
+          if (isExternalWebUrl(params.linkURL)) shell.openExternal(params.linkURL);
+        },
+      }));
       menu.append(new MenuItem({ label: 'Sao chép liên kết', click: () => require('electron').clipboard.writeText(params.linkURL) }));
     }
     if (params.mediaType === 'image') {
@@ -1497,8 +1713,14 @@ function createWindow() {
 
   // IPC
   ipcMain.on('switch-profile', async (event, profile) => {
+    const previousProfileId = activeProfileId;
     activeProfileId = profile.id;
     profileNames[profile.id] = profile.name || 'Messenger';
+    profilePartitions[profile.id] = profile.partition;
+    clearProfileSleepTimer(profile.id);
+    if (previousProfileId && previousProfileId !== profile.id) {
+      scheduleProfileSleep(previousProfileId);
+    }
     if (!browserViews[profile.id]) {
       const view = new BrowserView({
         webPreferences: {
@@ -1515,6 +1737,15 @@ function createWindow() {
     mainWindow.setBrowserView(browserViews[profile.id]);
     updateBrowserViewBounds();
     updateMessengerAwayMode();
+  });
+
+  ipcMain.on('profiles-updated', (event, profiles = []) => {
+    if (!Array.isArray(profiles)) return;
+    profiles.forEach((profile) => {
+      if (!profile?.id) return;
+      if (profile.name) profileNames[profile.id] = profile.name;
+      if (profile.partition) profilePartitions[profile.id] = profile.partition;
+    });
   });
 
   // ── Đăng xuất / Xóa session cho 1 profile ──
@@ -1588,12 +1819,21 @@ function createWindow() {
     }
   });
 
+  ipcMain.on('install-update-now', () => installDownloadedUpdate());
+
+  ipcMain.on('install-update-later', () => {
+    closeUpdateProgress();
+    setUpdateTrayState({ downloaded: !!updateTrayState.downloaded });
+  });
+
   ipcMain.on('delete-profile', (event, id) => {
     if (browserViews[id]) {
       destroyBrowserView(id);
     }
     delete profileUnreadCounts[id];
     delete profileNames[id];
+    delete profilePartitions[id];
+    clearProfileSleepTimer(id);
   });
 
   ipcMain.on('update-badge', (event, count) => {
@@ -1699,13 +1939,13 @@ function createWindow() {
 
   // ── Download IPC handlers ──
   ipcMain.on('open-download-file', (event, filePath) => {
-    if (filePath && fs.existsSync(filePath)) {
+    if (isSafeDownloadPath(filePath) && fs.existsSync(filePath)) {
       shell.openPath(filePath);
     }
   });
 
   ipcMain.on('open-download-folder', (event, filePath) => {
-    if (filePath && fs.existsSync(filePath)) {
+    if (isSafeDownloadPath(filePath) && fs.existsSync(filePath)) {
       shell.showItemInFolder(filePath);
     } else {
       shell.openPath(app.getPath('downloads'));
@@ -1738,7 +1978,7 @@ function updateBadge(count) {
     }
   }
   if (tray) {
-    tray.setToolTip(count > 0 ? `${APP_NAME} — ${count} tin nhắn chưa đọc` : APP_NAME);
+    tray.setToolTip(buildTrayTooltip());
   }
 }
 

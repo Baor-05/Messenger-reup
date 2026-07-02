@@ -22,6 +22,7 @@ let activeProfileId = profiles[0].id;
 
 function saveProfiles() {
   localStorage.setItem('mp_profiles', JSON.stringify(profiles));
+  ipcRenderer.send('profiles-updated', profiles);
 }
 
 // ============================================================
@@ -393,6 +394,7 @@ if(settings.alwaysOnTop) {
 }
 
 renderSidebar();
+ipcRenderer.send('profiles-updated', profiles);
 switchProfile(activeProfileId);
 
 // ============================================================
@@ -835,9 +837,18 @@ const updateProgressPercent = document.getElementById('update-progress-percent')
 const updateProgressTrack = document.getElementById('update-progress-track');
 const updateProgressFill = document.getElementById('update-progress-fill');
 const updateProgressClose = document.getElementById('update-progress-close');
+const updateInstallNow = document.getElementById('update-install-now');
+const updateInstallLater = document.getElementById('update-install-later');
+const updateReleaseNotes = document.getElementById('update-release-notes');
 
 updateProgressClose.addEventListener('click', () => {
   ipcRenderer.send('close-update-progress');
+});
+updateInstallNow.addEventListener('click', () => {
+  ipcRenderer.send('install-update-now');
+});
+updateInstallLater.addEventListener('click', () => {
+  ipcRenderer.send('install-update-later');
 });
 
 ipcRenderer.on('update-progress-state', (event, state = {}) => {
@@ -864,6 +875,10 @@ ipcRenderer.on('update-progress-state', (event, state = {}) => {
     ? 'Lỗi'
     : (hasPercent ? `${percent}%` : '...');
   updateProgressClose.classList.toggle('visible', state.phase === 'error');
+  updateInstallNow.classList.toggle('visible', state.phase === 'downloaded');
+  updateInstallLater.classList.toggle('visible', state.phase === 'downloaded');
+  updateReleaseNotes.textContent = state.releaseNotes || '';
+  updateReleaseNotes.classList.toggle('visible', !!state.releaseNotes);
 
   if (state.phase === 'downloading') {
     updateProgressStatus.textContent = 'Đang tải bản cập nhật...';

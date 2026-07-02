@@ -1,5 +1,11 @@
 # Changelog
 
+## Messenger v1.1.4
+
+- Thêm menu dọn cache để giảm dung lượng và xử lý lỗi session/tải trang.
+- Cải thiện cập nhật tự động: trạng thái bản mới trên tray, changelog trong cửa sổ cập nhật, nút "Cài ngay" và "Cài sau".
+- Thêm sleep profile nền để giảm RAM khi không dùng nhiều tài khoản cùng lúc.
+
 ## Messenger v1.1.3
 
 - Sửa lỗi tin nhắn bị kẹt ở trạng thái "Đang gửi" khi bật chặn "Đang nhập".

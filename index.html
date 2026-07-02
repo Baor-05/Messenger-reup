@@ -195,9 +195,10 @@
     .update-progress-actions {
       display: flex;
       justify-content: flex-end;
+      gap: 10px;
       margin-top: 20px;
     }
-    #update-progress-close {
+    .update-progress-action {
       display: none;
       min-width: 84px;
       padding: 9px 16px;
@@ -208,7 +209,33 @@
       cursor: pointer;
       font-weight: 600;
     }
-    #update-progress-close.visible { display: block; }
+    .update-progress-action.secondary {
+      color: #e4e6eb;
+      background: #4b4c4f;
+    }
+    body.light-mode .update-progress-action.secondary {
+      color: #050505;
+      background: #e4e6eb;
+    }
+    .update-progress-action.visible { display: block; }
+    .update-release-notes {
+      display: none;
+      max-height: 120px;
+      margin-top: 14px;
+      padding: 10px;
+      overflow: auto;
+      border-radius: 6px;
+      color: #d7d9dd;
+      background: rgba(255,255,255,0.06);
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    body.light-mode .update-release-notes {
+      color: #333;
+      background: rgba(0,0,0,0.05);
+    }
+    .update-release-notes.visible { display: block; }
     @keyframes update-progress-slide {
       from { transform: translateX(-120%); }
       to { transform: translateX(390%); }
@@ -515,8 +542,11 @@
       <div class="update-progress-track" id="update-progress-track">
         <div class="update-progress-fill" id="update-progress-fill"></div>
       </div>
+      <div class="update-release-notes" id="update-release-notes"></div>
       <div class="update-progress-actions">
-        <button id="update-progress-close" type="button">Đóng</button>
+        <button class="update-progress-action secondary" id="update-install-later" type="button">Cài sau</button>
+        <button class="update-progress-action" id="update-install-now" type="button">Cài ngay</button>
+        <button class="update-progress-action" id="update-progress-close" type="button">Đóng</button>
       </div>
     </section>
   </div>

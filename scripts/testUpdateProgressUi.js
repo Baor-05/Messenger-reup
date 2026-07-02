@@ -44,7 +44,8 @@ app.whenReady().then(async () => {
     window.webContents.send('update-progress-state', {
       visible: true,
       phase: 'downloading',
-      version: '1.1.3',
+      version: '1.1.4',
+      releaseNotes: '- Dọn cache\n- Sleep profile nền',
       percent: 67,
       transferred: 70254592,
       total: 104857600,
@@ -75,7 +76,7 @@ app.whenReady().then(async () => {
     })()`);
 
     assert.strictEqual(state.visible, true);
-    assert.strictEqual(state.heading, 'Đang cập nhật Messenger 1.1.3');
+    assert.strictEqual(state.heading, 'Đang cập nhật Messenger 1.1.4');
     assert.strictEqual(state.status, 'Đang tải bản cập nhật...');
     assert.strictEqual(state.percent, '67%');
     assert.ok(state.detail.includes('MB'));
@@ -86,7 +87,7 @@ app.whenReady().then(async () => {
     assert.ok(state.box.y >= 0);
     assert.ok(state.box.y + state.box.height <= state.viewport.height);
 
-    const screenshotPath = path.join(app.getPath('temp'), 'messenger-update-progress-1.1.3.png');
+    const screenshotPath = path.join(app.getPath('temp'), 'messenger-update-progress-1.1.4.png');
     const screenshot = await window.webContents.capturePage();
     fs.writeFileSync(screenshotPath, screenshot.toPNG());
 
